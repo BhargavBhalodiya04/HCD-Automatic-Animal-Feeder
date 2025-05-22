@@ -1,3 +1,4 @@
+
 #include <SoftwareSerial.h>
 
 // Ultrasonic Sensor Pins
@@ -10,28 +11,38 @@
 #define GREEN_LED A2
 
 // Motor A Pins
-const int ENA = 5;
-const int IN1 = 6;
-const int IN2 = 7;
+const int motorA1 = 8;
+const int motorA2 = 9;
+const int enableA = 10;
 
 // Motor B Pins
-const int IN3 = 8;
-const int IN4 = 9;
-const int ENB = 10;
+const int motorB1 = 7;
+const int motorB2 = 6;
+const int enableB = 5;
 
-// Bluetooth on pins 2 (RX), 3 (TX)
+// Bluetooth Module
 SoftwareSerial bluetooth(2, 3); // RX, TX
 
-// Timing and motor control
-unsigned long delayStartTime = 0;
-unsigned long motorStartTime = 0;
-unsigned long delayDuration = 0;
-unsigned long motorRunDuration = 60000UL; // Default 1 minute
-unsigned long speedReduceDelay = 10;      // 10 ms delay before reducing speed
-bool waitingToStart = false;
+// State Variables
+float delayTimeInMs = 1000;  // Default 1s
+int rotationTimeInSeconds = 1;
+bool startCycle = false;
+bool isPaused = false;
+bool cancelCycle = false;
 bool motorRunning = false;
-bool speedReduced = false;
+unsigned long lastActionTime = 0;
+String inputData = "";
 
+// Distance and LED
+long getDistance() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  return duration * 0.034 / 2;
+}
+
+// Setup
 void setup() {
   // Ultrasonic Sensor
   pinMode(TRIG_PIN, OUTPUT);
@@ -43,147 +54,110 @@ void setup() {
   pinMode(GREEN_LED, OUTPUT);
 
   // Motors
-  pinMode(ENA, OUTPUT);
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
-  pinMode(ENB, OUTPUT);
+  pinMode(motorA1, OUTPUT); pinMode(motorA2, OUTPUT); pinMode(enableA, OUTPUT);
+  pinMode(motorB1, OUTPUT); pinMode(motorB2, OUTPUT); pinMode(enableB, OUTPUT);
 
-  // Serial and Bluetooth
+  // Start Serial Communication
   Serial.begin(9600);
   bluetooth.begin(9600);
 
-  Serial.println("System Ready. Distance Sensor + LED + Motor Control + Bluetooth Echo");
-  bluetooth.println("System Ready. Send 1-9 for delay, followed by 1-9 for rotation time.");
+  Serial.println("System Ready.");
+  bluetooth.println("System Ready. Use 'delay,rotation' or commands 'p'=pause, 'c'=cancel.");
 }
 
-long getDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+// Stop motor function
+void stopMotors() {
+  digitalWrite(enableA, LOW);
+  digitalWrite(enableB, LOW);
+  digitalWrite(motorA1, LOW); digitalWrite(motorA2, LOW);
+  digitalWrite(motorB1, LOW); digitalWrite(motorB2, LOW);
+  motorRunning = false;
+}
 
-  long duration = pulseIn(ECHO_PIN, HIGH);
-  long distance = duration * 0.034 / 2;  // Convert to cm
-  return distance;
+// Start motor function
+void startMotors() {
+  digitalWrite(motorA1, HIGH); digitalWrite(motorA2, LOW);
+  digitalWrite(motorB1, HIGH); digitalWrite(motorB2, LOW);
+  digitalWrite(enableA, HIGH); digitalWrite(enableB, HIGH);
+  motorRunning = true;
+}
+
+void handleLEDs(long distance) {
+  if (distance <= 10) {
+    digitalWrite(RED_LED, HIGH); digitalWrite(BLUE_LED, LOW); digitalWrite(GREEN_LED, LOW);
+  } else if (distance <= 30) {
+    digitalWrite(RED_LED, LOW); digitalWrite(BLUE_LED, HIGH); digitalWrite(GREEN_LED, LOW);
+  } else if (distance <= 100) {
+    digitalWrite(RED_LED, LOW); digitalWrite(BLUE_LED, LOW); digitalWrite(GREEN_LED, HIGH);
+  } else {
+    digitalWrite(RED_LED, LOW); digitalWrite(BLUE_LED, LOW); digitalWrite(GREEN_LED, LOW);
+  }
 }
 
 void loop() {
-  // === Bluetooth Echo + Motor Commands ===
-  if (bluetooth.available()) {
-    char input = bluetooth.read();
-    Serial.print("BT: ");
-    Serial.println(input);
-    bluetooth.print("You sent: ");
-    bluetooth.println(input);
+  // Handle Bluetooth Input
+  while (bluetooth.available()) {
+    char received = bluetooth.read();
+    if (received == '\n' || received == '\r') {
+      inputData.trim();
 
-    if (input == '0') {
+      if (inputData.length() == 0) continue;
+
+      if (inputData.equalsIgnoreCase("p")) {
+        isPaused = !isPaused;
+        String msg = isPaused ? "⏸ Paused." : "▶ Resumed.";
+        Serial.println(msg); bluetooth.println(msg);
+      } else if (inputData.equalsIgnoreCase("c")) {
+        cancelCycle = true;
+        stopMotors();
+        startCycle = false;
+        Serial.println("❌ Canceled."); bluetooth.println("❌ Canceled.");
+      } else if (inputData.indexOf(',') > 0) {
+        int idx = inputData.indexOf(',');
+        float delayHrs = inputData.substring(0, idx).toFloat();
+        int rotSec = inputData.substring(idx + 1).toInt();
+
+        if (delayHrs > 0 && rotSec > 0) {
+          delayTimeInMs = delayHrs * 3600 * 1000UL;
+          rotationTimeInSeconds = rotSec;
+          startCycle = true;
+          cancelCycle = false;
+          motorRunning = false;
+          lastActionTime = millis();
+          String msg = "✅ Delay: " + String(delayHrs) + "h, Rotation: " + String(rotSec) + "s";
+          Serial.println(msg); bluetooth.println(msg);
+        } else {
+          bluetooth.println("❌ Invalid format or values.");
+        }
+      } else {
+        bluetooth.println("❌ Invalid command.");
+      }
+
+      inputData = "";
+    } else {
+      inputData += received;
+    }
+  }
+
+  // Motor timing logic
+  unsigned long currentMillis = millis();
+
+  if (startCycle && !cancelCycle) {
+    if (!motorRunning && currentMillis - lastActionTime >= delayTimeInMs && !isPaused) {
+      startMotors();
+      lastActionTime = currentMillis;
+      Serial.println("🟢 Motors ON"); bluetooth.println("🟢 Motors ON");
+    }
+
+    if (motorRunning && currentMillis - lastActionTime >= rotationTimeInSeconds * 1000UL && !isPaused) {
       stopMotors();
-      waitingToStart = false;
-      bluetooth.println("Motors stopped by user.");
-      Serial.println("Motors stopped by user.");
-    }
-    else if (input >= '1' && input <= '9') {
-      // First number for delay before motor start
-      int delaySec = input - '0';
-      delayDuration = delaySec * 1000UL;
-      delayStartTime = millis();
-      waitingToStart = true;
-      motorRunning = false;
-      speedReduced = false;
-
-      bluetooth.print("Motors will start after ");
-      bluetooth.print(delaySec);
-      bluetooth.println(" seconds.");
-      Serial.print("Motors will start after ");
-      Serial.print(delaySec);
-      Serial.println(" seconds.");
-    }
-    else if (input >= 'a' && input <= 'i') {
-      // Second number for rotation time (1-9, each representing 10-90 seconds)
-      int rotationSec = (input - 'a' + 1) * 10;
-      motorRunDuration = rotationSec * 1000UL; // Convert to milliseconds
-      bluetooth.print("Motor rotation time set to ");
-      bluetooth.print(rotationSec);
-      bluetooth.println(" seconds.");
-      Serial.print("Motor rotation time set to ");
-      Serial.print(rotationSec);
-      Serial.println(" seconds.");
+      Serial.println("🔴 Motors OFF"); bluetooth.println("🔴 Motors OFF");
+      startCycle = false;
     }
   }
 
-  // Also allow sending from Serial Monitor
-  if (Serial.available()) {
-    char c = Serial.read();
-    bluetooth.write(c);
-  }
-
-  // === Motor Start After Delay ===
-  if (waitingToStart && (millis() - delayStartTime >= delayDuration)) {
-    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, 100); // Motor A
-    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, 100); // Motor B
-
-    motorStartTime = millis();
-    motorRunning = true;
-    waitingToStart = false;
-
-    bluetooth.println("Motors started at high speed.");
-    Serial.println("Motors started at high speed.");
-  }
-
-  // === Reduce Motor Speed After Short Time ===
-  if (motorRunning && !speedReduced && millis() - motorStartTime >= speedReduceDelay) {
-    analogWrite(ENA, 40);
-    analogWrite(ENB, 40);
-    speedReduced = true;
-
-    bluetooth.println("Motor speeds reduced to 40.");
-    Serial.println("Motor speeds reduced to 40.");
-  }
-
-  // === Stop Motors After Custom Rotation Time ===
-  if (motorRunning && millis() - motorStartTime >= motorRunDuration) {
-    stopMotors();
-    bluetooth.println("Motors stopped after custom rotation time.");
-    Serial.println("Motors stopped after custom rotation time.");
-  }
-
-  // === Distance Sensing + LED Feedback ===
+  // LED and Distance Sensor
   long distance = getDistance();
-  Serial.print("Distance: ");
-  Serial.print(distance);
-  Serial.println(" cm");
-
-  if (distance <= 10) {
-    digitalWrite(RED_LED, HIGH);
-    digitalWrite(BLUE_LED, LOW);
-    digitalWrite(GREEN_LED, LOW);
-  } else if (distance <= 30) {
-    digitalWrite(RED_LED, LOW);
-    digitalWrite(BLUE_LED, HIGH);
-    digitalWrite(GREEN_LED, LOW);
-  } else if (distance <= 100) {
-    digitalWrite(RED_LED, LOW);
-    digitalWrite(BLUE_LED, LOW);
-    digitalWrite(GREEN_LED, HIGH);
-  } else {
-    digitalWrite(RED_LED, LOW);
-    digitalWrite(BLUE_LED, LOW);
-    digitalWrite(GREEN_LED, LOW);
-  }
-
-  delay(500); // Delay for sensor and LED stability
-}
-
-void stopMotors() {
-  analogWrite(ENA, 0);
-  analogWrite(ENB, 0);
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-  motorRunning = false;
-  speedReduced = false;
+  handleLEDs(distance);
+  delay(500);
 }
